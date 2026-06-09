@@ -53,6 +53,11 @@ export type SearchPayload = {
   results: SearchResult[];
 };
 
+export type LogsPayload = {
+  lines: string[];
+  count: number;
+};
+
 export type SearchFilters = {
   drive?: string;
   extension?: string;
@@ -101,6 +106,27 @@ export async function fetchStatus(): Promise<ApiStatus> {
   const response = await fetch(`${API_BASE}/status`);
   if (!response.ok) {
     throw new Error(`status failed: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function fetchLogs(limit = 500): Promise<LogsPayload> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  const response = await fetch(`${API_BASE}/api/logs?${params}`);
+  if (!response.ok) {
+    throw new Error(`logs failed: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function clearLogs(): Promise<LogsPayload> {
+  const response = await fetch(`${API_BASE}/api/logs/clear`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  if (!response.ok) {
+    throw new Error(`clear logs failed: ${response.status}`);
   }
   return response.json();
 }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -8,6 +9,8 @@ from pathlib import Path
 from typing import Callable
 
 from docvec.crawler import CrawlSummary
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_AUTO_SCAN_ROOTS = (Path(r"C:\\"), Path(r"D:\\"), Path(r"E:\\"))
 
@@ -86,11 +89,11 @@ class AutoScanScheduler:
             self._last_checked_at = now
 
             if not config.enabled:
-                self._last_skip_reason = "disabled"
+                self._set_skip_reason("disabled")
                 return False
 
             if self._is_scan_running():
-                self._last_skip_reason = "scan_running"
+                self._set_skip_reason("scan_running")
                 return False
 
             if (
@@ -98,21 +101,27 @@ class AutoScanScheduler:
                 and (now - self._last_triggered_at).total_seconds()
                 < config.interval_seconds
             ):
-                self._last_skip_reason = "waiting_for_interval"
+                self._set_skip_reason("waiting_for_interval")
                 return False
 
             environment = self._read_power_idle()
             self._last_environment = environment
             if config.require_charging and not environment.is_charging:
-                self._last_skip_reason = "waiting_for_charging"
+                self._set_skip_reason("waiting_for_charging")
                 return False
             if environment.idle_seconds < config.idle_seconds:
-                self._last_skip_reason = "waiting_for_idle"
+                self._set_skip_reason("waiting_for_idle")
                 return False
 
-            self._start_scan(list(config.roots))
+            try:
+                self._start_scan(list(config.roots))
+            except Exception:
+                logger.exception("Auto-scan trigger failed")
+                self._set_skip_reason("start_failed")
+                return False
             self._last_triggered_at = now
             self._last_skip_reason = ""
+            logger.info("Auto-scan triggered roots=%s", [str(root) for root in config.roots])
             return True
 
     def status(self) -> dict:
@@ -151,9 +160,18 @@ class AutoScanScheduler:
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
-            self.tick()
+            try:
+                self.tick()
+            except Exception:
+                logger.exception("Auto-scan tick failed")
+                with self._lock:
+                    self._last_skip_reason = "tick_failed"
             wait_seconds = max(1, self.config().check_interval_seconds)
             self._stop_event.wait(wait_seconds)
+
+    def _set_skip_reason(self, reason: str) -> None:
+        self._last_skip_reason = reason
+        logger.info("Auto-scan skipped reason=%s", reason)
 
 
 def read_windows_power_idle_state() -> PowerIdleState:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,6 +26,8 @@ from docvec.models import Chunk, ExtractedRecord
 from docvec.paths import classify_path
 from docvec.storage.db import DocVecDB
 from docvec.vectors import VectorBackend
+
+logger = logging.getLogger(__name__)
 
 
 class VectorIndexingError(RuntimeError):
@@ -95,6 +98,7 @@ class DocVecIndexer:
         return [extract_text_file(path, classification.kind)]
 
     def prepare_path(self, path: Path) -> PreparedIndex:
+        logger.debug("Preparing path for indexing path=%s", path)
         classification = classify_path(path)
         if classification.should_skip and not (
             self.ignore_skip_dirs and classification.reason in _IGNORABLE_SKIP_REASONS
@@ -106,6 +110,7 @@ class DocVecIndexer:
         chunks = []
         for record in records:
             chunks.extend(chunk_record(record, max_words=900, overlap_words=120))
+        logger.debug("Prepared path chunks=%s path=%s", len(chunks), path)
         return PreparedIndex(path=path, chunks=chunks)
 
     def index_path(self, path: Path) -> int:
@@ -136,7 +141,7 @@ class DocVecIndexer:
                 results[path_key] = 0
                 continue
 
-            chunk_ids = self.db.stage_chunks(chunks)
+            chunk_ids = self.db.stage_chunks_batch(chunks)
             activation_plan.append((prepared, chunk_ids))
             results[path_key] = len(chunks)
 
@@ -147,14 +152,21 @@ class DocVecIndexer:
 
         if missing_ids:
             try:
+                logger.debug(
+                    "Embedding and adding missing vectors count=%s sources=%s",
+                    len(missing_ids),
+                    len(activation_plan),
+                )
                 embeddings = self.embedder.embed(missing_texts)
                 self.vectors.add(missing_ids, embeddings)
                 self._save_vectors_if_needed()
             except Exception as error:
+                logger.exception("Vector indexing failed for batch")
                 try:
                     self.vectors.remove(missing_ids)
                     self._save_vectors_if_needed()
                 except Exception:
+                    logger.exception("Failed to roll back vectors after indexing failure")
                     pass
                 raise VectorIndexingError(str(error)) from error
 
@@ -180,12 +192,14 @@ class DocVecIndexer:
         if deactivated_ids:
             self.vectors.remove(deactivated_ids)
             self.vectors.save()
+            logger.info("Deleted indexed source path=%s removed_vectors=%s", path, len(deactivated_ids))
         return len(deactivated_ids)
 
     def flush(self) -> None:
         if self._vectors_dirty:
             self.vectors.save()
             self._vectors_dirty = False
+            logger.info("Flushed vector backend to disk")
         if self.defer_vector_save and self._storage_budget_checked_since_flush:
             self._check_storage_budget()
             self._storage_budget_checked_since_flush = False

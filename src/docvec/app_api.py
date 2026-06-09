@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -15,8 +16,11 @@ from urllib.parse import parse_qs, urlparse
 from docvec.auto_scan import AutoScanConfig, AutoScanScheduler
 from docvec.config import STORAGE_HARD_STOP_BYTES, STORAGE_WARNING_BYTES, data_usage_bytes
 from docvec.crawler import CrawlController, CrawlSummary
+from docvec.logging import clear_log_lines, configure_docvec_logging, recent_log_lines
 from docvec.models import SearchResult
 from docvec.runtime import DocVecRuntime
+
+logger = logging.getLogger(__name__)
 
 
 class DocVecApiServer(ThreadingHTTPServer):
@@ -27,6 +31,7 @@ class DocVecApiServer(ThreadingHTTPServer):
         auto_scan_config: AutoScanConfig | None = None,
         auto_scan_enabled: bool = False,
     ) -> None:
+        configure_docvec_logging()
         super().__init__(server_address, DocVecApiHandler)
         self.runtime = runtime
         self.controller = CrawlController()
@@ -77,12 +82,14 @@ class DocVecApiServer(ThreadingHTTPServer):
                 name="docvec-scan",
             )
             self._scan_thread.start()
+            logger.info("Background scan started roots=%s", [str(root) for root in roots])
             return self._background_summary
 
     def _run_background_scan(self, roots: list[Path], include_archives: bool) -> None:
         try:
             summary = self.crawl(roots, include_archives=include_archives)
         except Exception as error:
+            logger.exception("Background scan failed")
             job_id = self._record_background_error(str(error))
             summary = CrawlSummary(
                 status="error",
@@ -150,6 +157,12 @@ class DocVecApiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/logs":
+            params = parse_qs(parsed.query)
+            limit = max(1, min(_parse_int(params.get("limit", ["500"])[0], 500), 500))
+            lines = recent_log_lines(limit)
+            self._write_json({"lines": lines, "count": len(lines)})
+            return
         if parsed.path == "/status":
             self._write_json(self._status_payload())
             return
@@ -211,6 +224,10 @@ class DocVecApiHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         payload = self._read_json()
+        if parsed.path == "/api/logs/clear":
+            clear_log_lines()
+            self._write_json({"ok": True, "lines": [], "count": 0})
+            return
         if parsed.path == "/scan":
             roots = [Path(root) for root in payload.get("roots", [])]
             include_archives = bool(payload.get("include_archives", False))

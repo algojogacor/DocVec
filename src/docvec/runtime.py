@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,9 +15,12 @@ from docvec.crawler import (
 )
 from docvec.embeddings import FakeEmbedder, OllamaEmbedder
 from docvec.indexer import DocVecIndexer
+from docvec.logging import configure_docvec_logging
 from docvec.search import DocVecSearch
 from docvec.storage.db import DocVecDB
 from docvec.vectors import InMemoryVectorBackend, TurboVecBackend, VectorBackend
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -37,6 +41,7 @@ def build_runtime(
     fake: bool = False,
     include_archives: bool = False,
 ) -> DocVecRuntime:
+    configure_docvec_logging()
     db = DocVecDB(db_path)
     db.initialize()
     if fake:
@@ -54,6 +59,7 @@ def build_runtime(
         ignore_skip_dirs=fake,
         include_archives=include_archives,
     )
+    _warn_if_recent_vectors_missing(indexer, db)
     search = DocVecSearch(db=db, embedder=embedder, vectors=vectors)
     crawler = DocVecCrawler(
         db=db,
@@ -76,3 +82,19 @@ def build_runtime(
 
 def _env_int(name: str, default: int) -> int:
     return int(os.environ.get(name, str(default)))
+
+
+def _warn_if_recent_vectors_missing(indexer: DocVecIndexer, db: DocVecDB) -> None:
+    # Startup consistency sample catches interrupted runs where SQLite activated chunks
+    # before vectors were persisted to disk.
+    missing_sources: list[str] = []
+    for source_path in db.list_recent_active_source_paths(limit=25):
+        if not indexer.has_vectors_for_source(Path(source_path)):
+            missing_sources.append(source_path)
+        if len(missing_sources) >= 5:
+            break
+    if missing_sources:
+        logger.warning(
+            "Vector index may be missing active SQLite chunks sample_missing_sources=%s",
+            missing_sources,
+        )

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from contextlib import closing
 from pathlib import Path
 from typing import Any
 
 from docvec.models import Chunk, SearchResult, SourceKind
+
+logger = logging.getLogger(__name__)
 
 
 class DocVecDB:
@@ -32,12 +35,18 @@ class DocVecDB:
             for row in connection.execute("PRAGMA table_info(chunks)").fetchall()
         }
         if "vector_status" not in columns:
-            connection.execute(
-                """
-                ALTER TABLE chunks
-                ADD COLUMN vector_status TEXT NOT NULL DEFAULT 'indexed'
-                """
-            )
+            try:
+                connection.execute(
+                    """
+                    ALTER TABLE chunks
+                    ADD COLUMN vector_status TEXT NOT NULL DEFAULT 'indexed'
+                    """
+                )
+            except sqlite3.OperationalError as error:
+                if "duplicate column" in str(error).lower():
+                    return
+                logger.exception("SQLite migration failed")
+                raise
 
     def upsert_chunk(self, chunk: Chunk) -> int:
         metadata_json = json.dumps(chunk.metadata, ensure_ascii=False, sort_keys=True)
@@ -46,9 +55,13 @@ class DocVecDB:
                 return self._upsert_chunk(connection, chunk, metadata_json, activate=True)
 
     def stage_chunk(self, chunk: Chunk) -> int:
-        return self.stage_chunks([chunk])[0]
+        return self.stage_chunks_batch([chunk])[0]
 
     def stage_chunks(self, chunks: list[Chunk]) -> list[int]:
+        return self.stage_chunks_batch(chunks)
+
+    def stage_chunks_batch(self, chunks: list[Chunk]) -> list[int]:
+        # Stage chunk text in one transaction so batch indexing does not reopen SQLite per chunk.
         if not chunks:
             return []
 
@@ -622,6 +635,57 @@ class DocVecDB:
 
     def get_chunk_text(self, chunk_id: int) -> str:
         return self.get_chunk(chunk_id).text
+
+    def get_chunks_by_ids(self, ids: list[int]) -> dict[int, Chunk]:
+        # Fetch semantic search candidates in one SQLite round trip.
+        unique_ids = sorted(set(ids))
+        if not unique_ids:
+            return {}
+
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                  id,
+                  source_path,
+                  source_kind,
+                  title,
+                  text,
+                  metadata_json,
+                  ordinal,
+                  content_hash
+                FROM chunks
+                WHERE active = 1
+                  AND id IN ({_placeholders(unique_ids)})
+                """,
+                unique_ids,
+            ).fetchall()
+
+        return {int(row["id"]): self._row_to_chunk(row) for row in rows}
+
+    def list_recent_active_source_paths(self, limit: int = 20) -> list[str]:
+        # Runtime startup samples recent active chunks to detect missing vector IDs.
+        limit = max(1, min(limit, 500))
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT source_path
+                FROM chunks
+                WHERE active = 1
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        source_paths: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            source_path = str(row["source_path"]).split("#", 1)[0]
+            if source_path in seen:
+                continue
+            seen.add(source_path)
+            source_paths.append(source_path)
+        return source_paths
 
     def get_surrounding_chunks(self, chunk_id: int, radius: int = 1) -> list[Chunk]:
         radius = max(0, min(radius, 10))

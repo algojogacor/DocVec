@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import logging
+import os
+import threading
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Protocol
 
-from docvec.config import is_skip_dir_name, max_file_bytes_for_path
+from docvec.config import StorageBudgetExceeded, is_skip_dir_name, max_file_bytes_for_path
 from docvec.fingerprints import FileFingerprint, fingerprint_file
 from docvec.indexer import VectorIndexingError
 from docvec.models import Classification, SourceKind
 from docvec.paths import classify_path, is_c_drive_allowed_scope_or_ancestor
 from docvec.storage.db import DocVecDB
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_SAVE_EVERY = 100
@@ -67,6 +72,7 @@ class DocVecCrawler:
         self.index_batch_size = max(1, index_batch_size)
         self.max_in_flight = max(1, max_in_flight)
         self._pending_flush_sources: list[_IndexedSource] = []
+        self._crawl_lock = threading.Lock()
 
     def discover(self, roots: list[Path]) -> Iterator[Path]:
         for root in roots:
@@ -77,9 +83,16 @@ class DocVecCrawler:
         roots: list[Path],
         controller: CrawlController | None = None,
     ) -> CrawlSummary:
-        if controller is None and self._can_use_pipeline():
-            return self._crawl_pipelined(roots)
-        return self._crawl_sequential(roots, controller=controller)
+        with self._crawl_lock:
+            self._pending_flush_sources.clear()
+            logger.info(
+                "Crawl start roots=%s pipeline=%s",
+                [str(root) for root in roots],
+                controller is None and self._can_use_pipeline(),
+            )
+            if controller is None and self._can_use_pipeline():
+                return self._crawl_pipelined(roots)
+            return self._crawl_sequential(roots, controller=controller)
 
     def _crawl_sequential(
         self,
@@ -112,7 +125,16 @@ class DocVecCrawler:
                         )
                     counts.discovered_count += 1
                     seen_paths.add(str(path))
-                    indexed_source = self._crawl_file(path, root, counts)
+                    try:
+                        indexed_source = self._crawl_file(path, root, counts)
+                    except StorageBudgetExceeded as error:
+                        logger.exception("Storage budget exceeded while crawling path=%s", path)
+                        return self._finish_job(
+                            job_id,
+                            counts,
+                            status="error",
+                            message=f"storage budget exceeded: {error}",
+                        )
                     if indexed_source is not None:
                         self._pending_flush_sources.append(indexed_source)
                     flush_error = self._maybe_flush_indexer(counts)
@@ -222,19 +244,52 @@ class DocVecCrawler:
 
     def _iter_files(self, directory: Path) -> Iterator[Path]:
         try:
-            children = sorted(directory.iterdir(), key=lambda item: item.name.lower())
+            # DirEntry caches type checks, avoiding repeated pathlib stat calls per child.
+            with os.scandir(directory) as entries:
+                children = sorted(entries, key=lambda item: item.name.lower())
         except OSError:
+            logger.exception("Unable to enumerate directory path=%s", directory)
             return
 
-        for child in children:
-            if child.is_symlink():
-                continue
-            if child.is_dir():
-                if self._should_skip_directory(child, directory):
+        for entry in children:
+            child = Path(entry.path)
+            try:
+                if entry.is_symlink():
                     continue
-                yield from self._iter_files(child)
-            elif child.is_file():
-                yield child
+                if entry.is_dir(follow_symlinks=False):
+                    if self._should_skip_directory(child, directory):
+                        continue
+                    yield from self._iter_files(child)
+                elif entry.is_file(follow_symlinks=False):
+                    yield child
+            except OSError:
+                logger.exception("Unable to inspect directory entry path=%s", child)
+                continue
+
+    def _fingerprint_or_record_error(
+        self,
+        path: Path,
+        classification: Classification,
+        counts: "_CrawlCounts",
+    ) -> FileFingerprint | None:
+        try:
+            return fingerprint_file(path)
+        except OSError:
+            logger.exception("Unable to fingerprint file path=%s", path)
+            self._record_source_file(
+                path=path,
+                classification=classification,
+                fingerprint=FileFingerprint(
+                    path=str(path),
+                    size_bytes=0,
+                    mtime_ns=0,
+                    fingerprint="fingerprint_unavailable",
+                ),
+                status="error",
+                error="fingerprint unavailable",
+            )
+            counts.error_count += 1
+            return None
 
     def _crawl_file(
         self,
@@ -243,7 +298,10 @@ class DocVecCrawler:
         counts: _CrawlCounts,
     ) -> "_IndexedSource | None":
         classification = self._classify_for_root(path, root)
-        file_fingerprint = fingerprint_file(path)
+        file_fingerprint = self._fingerprint_or_record_error(path, classification, counts)
+        if file_fingerprint is None:
+            return None
+
         stored = self.db.get_source_file(str(path))
         if (
             stored is not None
@@ -255,8 +313,12 @@ class DocVecCrawler:
             return None
 
         try:
+            logger.debug("Indexing file path=%s", path)
             indexed_chunks = self.indexer.index_path(path)
+        except StorageBudgetExceeded:
+            raise
         except VectorIndexingError as error:
+            logger.exception("Vector indexing failed for file path=%s", path)
             self._record_source_file(
                 path=path,
                 classification=classification,
@@ -267,6 +329,7 @@ class DocVecCrawler:
             counts.error_count += 1
             return None
         except Exception as error:
+            logger.exception("Indexing failed for file path=%s", path)
             self._record_source_file(
                 path=path,
                 classification=classification,
@@ -342,7 +405,9 @@ class DocVecCrawler:
         counts: _CrawlCounts,
     ) -> "_IndexCandidate | None":
         classification = self._classify_for_root(path, root)
-        file_fingerprint = fingerprint_file(path)
+        file_fingerprint = self._fingerprint_or_record_error(path, classification, counts)
+        if file_fingerprint is None:
+            return None
         stored = self.db.get_source_file(str(path))
         if (
             stored is not None
@@ -382,6 +447,7 @@ class DocVecCrawler:
             try:
                 prepared_batch.append(future.result())
             except Exception as error:
+                logger.exception("Preparing file failed path=%s", candidate.path)
                 self._record_source_file(
                     path=candidate.path,
                     classification=candidate.classification,
@@ -418,7 +484,11 @@ class DocVecCrawler:
         batch_indexer = getattr(self.indexer, "index_prepared_batch")
         try:
             results = batch_indexer([item.prepared for item in batch])
+        except StorageBudgetExceeded as error:
+            logger.exception("Storage budget exceeded for prepared batch size=%s", len(batch))
+            return f"storage budget exceeded: {error}"
         except VectorIndexingError as error:
+            logger.exception("Vector indexing failed for prepared batch size=%s", len(batch))
             for item in batch:
                 self._record_source_file(
                     path=item.candidate.path,
@@ -430,6 +500,7 @@ class DocVecCrawler:
                 counts.error_count += 1
             return f"vector indexing failed: {error}"
         except Exception as error:
+            logger.exception("Indexing failed for prepared batch size=%s", len(batch))
             for item in batch:
                 self._record_source_file(
                     path=item.candidate.path,
@@ -501,6 +572,7 @@ class DocVecCrawler:
         try:
             flusher()
         except Exception as error:
+            logger.exception("Vector flush failed")
             message = str(error)
             pending = list(self._pending_flush_sources)
             self._pending_flush_sources.clear()
@@ -515,7 +587,13 @@ class DocVecCrawler:
                 )
                 counts.error_count += 1
             return f"vector flush failed: {message}"
+        flushed_sources = len(self._pending_flush_sources)
         self._pending_flush_sources.clear()
+        logger.info(
+            "Flush completed indexed_count=%s pending_sources=%s",
+            counts.indexed_count,
+            flushed_sources,
+        )
         return None
 
     def _set_deferred_vector_save(self, enabled: bool) -> bool | None:
@@ -548,10 +626,20 @@ class DocVecCrawler:
         try:
             size_bytes = path.stat().st_size
         except OSError:
+            logger.exception("Unable to stat file for skip check path=%s", path)
             return True
         if classification.kind == SourceKind.AI_SESSION:
             return False
-        return size_bytes > max_file_bytes_for_path(path)
+        max_file_bytes = max_file_bytes_for_path(path)
+        if size_bytes > max_file_bytes:
+            logger.warning(
+                "Skipping file due to size path=%s size_bytes=%s max_file_bytes=%s",
+                path,
+                size_bytes,
+                max_file_bytes,
+            )
+            return True
+        return False
 
     def _is_included_archive(self, classification: Classification, path: Path) -> bool:
         return (
@@ -616,6 +704,15 @@ class DocVecCrawler:
         message: str,
     ) -> CrawlSummary:
         self._update_job(job_id, counts, status=status, message=message)
+        logger.info(
+            "Crawl end status=%s discovered=%s indexed=%s skipped=%s errors=%s job_id=%s",
+            status,
+            counts.discovered_count,
+            counts.indexed_count,
+            counts.skipped_count,
+            counts.error_count,
+            job_id,
+        )
         return CrawlSummary(
             status=status,
             discovered_count=counts.discovered_count,

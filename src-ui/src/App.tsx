@@ -19,6 +19,9 @@ import {
   Rows3,
   Search,
   Sparkles,
+  Terminal,
+  Trash2,
+  X,
 } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import {
@@ -27,7 +30,9 @@ import {
   ScanSummary,
   SearchResult,
   SearchFilters,
+  clearLogs,
   fetchContext,
+  fetchLogs,
   fetchSavedSearches,
   fetchStatus,
   openDocVecPath,
@@ -187,6 +192,11 @@ function storageLabel(status: ApiStatus | null): string {
   return `${prefix}: ${formatBytes(status.storage_usage_bytes)}`;
 }
 
+function logLevelClass(line: string): string {
+  const match = line.match(/\s(DEBUG|INFO|WARNING|ERROR)\s/);
+  return match ? `log-entry ${match[1].toLowerCase()}` : "log-entry";
+}
+
 function autoScanLabel(status: ApiStatus | null): string {
   const autoScan = status?.auto_scan;
   if (!autoScan) {
@@ -229,6 +239,9 @@ export function App() {
   const [viewMode, setViewMode] = useState<ViewMode>("details");
   const [sortKey, setSortKey] = useState<SortKey>("score");
   const [sortDirection, setSortDirection] = useState<SortDirection>("desc");
+  const [logsOpen, setLogsOpen] = useState(false);
+  const [logLines, setLogLines] = useState<string[]>([]);
+  const [logError, setLogError] = useState<string | null>(null);
 
   const sortedResults = useMemo(
     () => [...results].sort((left, right) => compareResults(left, right, sortKey, sortDirection)),
@@ -281,6 +294,16 @@ export function App() {
       setApiError(null);
     } catch (error) {
       setApiError(error instanceof Error ? error.message : "Saved searches failed");
+    }
+  }
+
+  async function loadLogs() {
+    try {
+      const payload = await fetchLogs(500);
+      setLogLines(payload.lines);
+      setLogError(null);
+    } catch (error) {
+      setLogError(error instanceof Error ? error.message : "Logs unavailable");
     }
   }
 
@@ -419,6 +442,25 @@ export function App() {
     }
   }
 
+  async function copyVisibleLogs() {
+    try {
+      await navigator.clipboard.writeText(logLines.join("\n"));
+      setPreviewMessage("Logs copied");
+    } catch {
+      setLogError("Copy failed");
+    }
+  }
+
+  async function clearVisibleLogs() {
+    try {
+      await clearLogs();
+      setLogLines([]);
+      setLogError(null);
+    } catch (error) {
+      setLogError(error instanceof Error ? error.message : "Clear failed");
+    }
+  }
+
   function onSubmit(event: FormEvent) {
     event.preventDefault();
     void runSearch();
@@ -444,6 +486,17 @@ export function App() {
     void refreshStatus();
     void loadSavedSearches();
   }, []);
+
+  useEffect(() => {
+    if (!logsOpen) {
+      return;
+    }
+    void loadLogs();
+    const timer = window.setInterval(() => {
+      void loadLogs();
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [logsOpen]);
 
   useEffect(() => {
     if (!selected) {
@@ -541,6 +594,10 @@ export function App() {
           <button onClick={() => void saveCurrentSearch()}>
             <Database size={16} />
             <span>Save</span>
+          </button>
+          <button onClick={() => setLogsOpen((current) => !current)}>
+            <Terminal size={16} />
+            <span>Logs</span>
           </button>
           <select
             className="saved-search-select"
@@ -811,6 +868,40 @@ export function App() {
           <span>{visibleJob ? `${visibleJob.status}: ${visibleJob.indexed_count} indexed` : "Ready"}</span>
         </footer>
       </section>
+
+      {logsOpen ? (
+        <aside className="logs-drawer" aria-label="Logs">
+          <div className="logs-header">
+            <div>
+              <strong>Logs</strong>
+              <span>{logLines.length} entries</span>
+            </div>
+            <div className="logs-actions">
+              <button onClick={() => void copyVisibleLogs()} title="Copy logs">
+                <Copy size={15} />
+              </button>
+              <button onClick={() => void clearVisibleLogs()} title="Clear logs">
+                <Trash2 size={15} />
+              </button>
+              <button onClick={() => setLogsOpen(false)} title="Close logs">
+                <X size={15} />
+              </button>
+            </div>
+          </div>
+          {logError ? <p className="logs-error">{logError}</p> : null}
+          <div className="logs-list">
+            {logLines.length === 0 ? (
+              <div className="logs-empty">No log entries.</div>
+            ) : (
+              logLines.map((line, index) => (
+                <pre className={logLevelClass(line)} key={`${index}-${line}`}>
+                  {line}
+                </pre>
+              ))
+            )}
+          </div>
+        </aside>
+      ) : null}
     </main>
   );
 }

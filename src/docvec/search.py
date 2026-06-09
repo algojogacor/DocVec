@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import date, datetime
 from dataclasses import replace
+from datetime import date, datetime
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,8 @@ from docvec.embeddings import Embedder
 from docvec.models import SearchResult
 from docvec.storage.db import DocVecDB
 from docvec.vectors import VectorBackend
+
+logger = logging.getLogger(__name__)
 
 SEMANTIC_CANDIDATE_OVERFETCH_FACTOR = 8
 SEMANTIC_CANDIDATE_MINIMUM = 50
@@ -36,6 +39,7 @@ class DocVecSearch:
         try:
             semantic_candidates = self._semantic_search(query, candidate_limit)
         except Exception:
+            logger.exception("Semantic search failed; falling back to FTS")
             semantic_candidates = []
         semantic_results = self._filter_results(semantic_candidates, filters or {})[:limit]
         fts_results = self._filter_results(
@@ -68,11 +72,11 @@ class DocVecSearch:
             SEMANTIC_CANDIDATE_MINIMUM,
         )
         matches = self.vectors.search(vector, k=candidate_limit)
+        chunks_by_id = self.db.get_chunks_by_ids([chunk_id for chunk_id, _score in matches])
         results: list[SearchResult] = []
         for chunk_id, score in matches:
-            try:
-                chunk = self.db.get_chunk(chunk_id)
-            except KeyError:
+            chunk = chunks_by_id.get(chunk_id)
+            if chunk is None:
                 continue
             results.append(
                 SearchResult(

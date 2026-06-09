@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 class VectorBackend(Protocol):
@@ -45,6 +48,7 @@ class InMemoryVectorBackend:
             raise ValueError(f"expected {vectors.shape[0]} ids, got {len(ids)}")
         if len(set(ids)) != len(ids) or set(ids).intersection(self.ids):
             raise ValueError("duplicate ids are not allowed")
+        logger.debug("Adding vectors to in-memory backend count=%s", len(ids))
         self.ids.extend(ids)
         self.matrix = vectors.copy() if self.matrix is None else np.vstack([self.matrix, vectors])
 
@@ -74,6 +78,7 @@ class InMemoryVectorBackend:
         keep_indexes = [index for index, id_ in enumerate(self.ids) if id_ not in ids_to_remove]
         if len(keep_indexes) == len(self.ids):
             return
+        logger.debug("Removing vectors from in-memory backend count=%s", len(ids_to_remove))
         if not keep_indexes:
             self.ids = []
             self.matrix = None
@@ -96,6 +101,12 @@ class TurboVecBackend:
             self._index = IdMapIndex.load(str(path))
             loaded_dim = self._index.dim
             if loaded_dim is not None and int(loaded_dim) != dim:
+                logger.error(
+                    "TurboVec dimension mismatch path=%s loaded_dim=%s expected_dim=%s",
+                    path,
+                    loaded_dim,
+                    dim,
+                )
                 raise ValueError(
                     f"loaded vector dim {loaded_dim} does not match expected dim {dim}"
                 )
@@ -105,6 +116,7 @@ class TurboVecBackend:
 
     def add(self, ids: list[int], vectors: np.ndarray) -> None:
         np_ids = np.asarray(ids, dtype=np.uint64)
+        logger.debug("Adding vectors to TurboVec backend count=%s", len(ids))
         self._index.add_with_ids(vectors.astype(np.float32), np_ids)
 
     def search(self, query: np.ndarray, k: int) -> list[tuple[int, float]]:
@@ -115,6 +127,9 @@ class TurboVecBackend:
         return bool(self._index.contains(int(id_)))
 
     def remove(self, ids: list[int]) -> None:
+        # TurboVec 0.7 exposes only per-id removal; keep this loop until a batch API exists.
+        if ids:
+            logger.debug("Removing vectors from TurboVec backend count=%s", len(ids))
         for id_ in ids:
             self._index.remove(int(id_))
 
