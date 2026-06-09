@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Protocol
@@ -10,6 +11,12 @@ from docvec.indexer import VectorIndexingError
 from docvec.models import Classification, SourceKind
 from docvec.paths import classify_path, is_c_drive_allowed_scope_or_ancestor
 from docvec.storage.db import DocVecDB
+
+
+DEFAULT_SAVE_EVERY = 100
+DEFAULT_EXTRACT_WORKERS = 4
+DEFAULT_INDEX_BATCH_SIZE = 32
+DEFAULT_MAX_IN_FLIGHT = 128
 
 
 class IndexerLike(Protocol):
@@ -47,10 +54,19 @@ class DocVecCrawler:
         db: DocVecDB,
         indexer: IndexerLike,
         include_archives: bool = False,
+        save_every: int = DEFAULT_SAVE_EVERY,
+        extract_workers: int = DEFAULT_EXTRACT_WORKERS,
+        index_batch_size: int = DEFAULT_INDEX_BATCH_SIZE,
+        max_in_flight: int = DEFAULT_MAX_IN_FLIGHT,
     ) -> None:
         self.db = db
         self.indexer = indexer
         self.include_archives = include_archives
+        self.save_every = max(1, save_every)
+        self.extract_workers = max(1, extract_workers)
+        self.index_batch_size = max(1, index_batch_size)
+        self.max_in_flight = max(1, max_in_flight)
+        self._pending_flush_sources: list[_IndexedSource] = []
 
     def discover(self, roots: list[Path]) -> Iterator[Path]:
         for root in roots:
@@ -61,22 +77,133 @@ class DocVecCrawler:
         roots: list[Path],
         controller: CrawlController | None = None,
     ) -> CrawlSummary:
+        if controller is None and self._can_use_pipeline():
+            return self._crawl_pipelined(roots)
+        return self._crawl_sequential(roots, controller=controller)
+
+    def _crawl_sequential(
+        self,
+        roots: list[Path],
+        controller: CrawlController | None = None,
+    ) -> CrawlSummary:
         self.db.initialize()
         job_id = self.db.create_index_job(";".join(str(root) for root in roots))
         counts = _CrawlCounts()
         seen_paths: set[str] = set()
+        previous_defer = self._set_deferred_vector_save(True)
 
-        for root in roots:
-            for path in self._discover_root(root):
-                if controller is not None and controller.should_pause():
-                    return self._finish_job(job_id, counts, status="paused", message="paused")
-                counts.discovered_count += 1
-                seen_paths.add(str(path))
-                self._crawl_file(path, root, counts)
-                self._update_job(job_id, counts, status="running", message=str(path))
-            self._mark_deleted_sources(root, seen_paths)
+        try:
+            for root in roots:
+                for path in self._discover_root(root):
+                    if controller is not None and controller.should_pause():
+                        flush_error = self._flush_indexer(counts)
+                        if flush_error is not None:
+                            return self._finish_job(
+                                job_id,
+                                counts,
+                                status="error",
+                                message=flush_error,
+                            )
+                        return self._finish_job(
+                            job_id,
+                            counts,
+                            status="paused",
+                            message="paused",
+                        )
+                    counts.discovered_count += 1
+                    seen_paths.add(str(path))
+                    indexed_source = self._crawl_file(path, root, counts)
+                    if indexed_source is not None:
+                        self._pending_flush_sources.append(indexed_source)
+                    flush_error = self._maybe_flush_indexer(counts)
+                    if flush_error is not None:
+                        return self._finish_job(
+                            job_id,
+                            counts,
+                            status="error",
+                            message=flush_error,
+                        )
+                    self._update_job(job_id, counts, status="running", message=str(path))
+                self._mark_deleted_sources(root, seen_paths)
 
-        return self._finish_job(job_id, counts, status="completed", message="completed")
+            flush_error = self._flush_indexer(counts)
+            if flush_error is not None:
+                return self._finish_job(job_id, counts, status="error", message=flush_error)
+
+            return self._finish_job(job_id, counts, status="completed", message="completed")
+        finally:
+            self._restore_deferred_vector_save(previous_defer)
+
+    def _crawl_pipelined(self, roots: list[Path]) -> CrawlSummary:
+        self.db.initialize()
+        job_id = self.db.create_index_job(";".join(str(root) for root in roots))
+        counts = _CrawlCounts()
+        seen_paths: set[str] = set()
+        previous_defer = self._set_deferred_vector_save(True)
+
+        try:
+            for root in roots:
+                prepared_batch: list[_PreparedCandidate] = []
+                pending: dict[Future, _IndexCandidate] = {}
+                with ThreadPoolExecutor(max_workers=self.extract_workers) as executor:
+                    for path in self._discover_root(root):
+                        counts.discovered_count += 1
+                        seen_paths.add(str(path))
+                        candidate = self._index_candidate(path, root, counts)
+                        if candidate is None:
+                            self._update_job(
+                                job_id,
+                                counts,
+                                status="running",
+                                message=str(path),
+                            )
+                            continue
+
+                        pending[executor.submit(self._prepare_candidate, candidate)] = candidate
+                        while len(pending) >= self.max_in_flight:
+                            flush_error = self._drain_ready_prepared(
+                                pending,
+                                prepared_batch,
+                                counts,
+                                job_id,
+                                wait_for_one=True,
+                            )
+                            if flush_error is not None:
+                                return self._finish_job(
+                                    job_id,
+                                    counts,
+                                    status="error",
+                                    message=flush_error,
+                                )
+
+                    while pending:
+                        flush_error = self._drain_ready_prepared(
+                            pending,
+                            prepared_batch,
+                            counts,
+                            job_id,
+                            wait_for_one=True,
+                        )
+                        if flush_error is not None:
+                            return self._finish_job(
+                                job_id,
+                                counts,
+                                status="error",
+                                message=flush_error,
+                            )
+
+                flush_error = self._flush_prepared_batch(prepared_batch, counts, job_id)
+                if flush_error is not None:
+                    return self._finish_job(job_id, counts, status="error", message=flush_error)
+                self._mark_deleted_sources(root, seen_paths)
+
+            flush_error = self._flush_indexer(counts)
+            if flush_error is not None:
+                return self._finish_job(job_id, counts, status="error", message=flush_error)
+
+            return self._finish_job(job_id, counts, status="completed", message="completed")
+        finally:
+            self._restore_deferred_vector_save(previous_defer)
 
     def _discover_root(self, root: Path) -> Iterator[Path]:
         if not root.exists():
@@ -109,7 +236,12 @@ class DocVecCrawler:
             elif child.is_file():
                 yield child
 
-    def _crawl_file(self, path: Path, root: Path, counts: _CrawlCounts) -> None:
+    def _crawl_file(
+        self,
+        path: Path,
+        root: Path,
+        counts: _CrawlCounts,
+    ) -> "_IndexedSource | None":
         classification = self._classify_for_root(path, root)
         file_fingerprint = fingerprint_file(path)
         stored = self.db.get_source_file(str(path))
@@ -120,7 +252,7 @@ class DocVecCrawler:
             and self._has_index_artifacts(path)
         ):
             counts.skipped_count += 1
-            return
+            return None
 
         try:
             indexed_chunks = self.indexer.index_path(path)
@@ -133,7 +265,7 @@ class DocVecCrawler:
                 error=str(error),
             )
             counts.error_count += 1
-            return
+            return None
         except Exception as error:
             self._record_source_file(
                 path=path,
@@ -143,7 +275,7 @@ class DocVecCrawler:
                 error=str(error),
             )
             counts.error_count += 1
-            return
+            return None
 
         if indexed_chunks <= 0:
             self._record_source_file(
@@ -154,7 +286,7 @@ class DocVecCrawler:
                 error=None,
             )
             counts.skipped_count += 1
-            return
+            return None
 
         self._record_source_file(
             path=path,
@@ -164,6 +296,7 @@ class DocVecCrawler:
             error=None,
         )
         counts.indexed_count += 1
+        return _IndexedSource(path, classification, file_fingerprint)
 
     def _has_index_artifacts(self, path: Path) -> bool:
         checker = getattr(self.indexer, "has_vectors_for_source", None)
@@ -201,6 +334,201 @@ class DocVecCrawler:
             status=status,
             error=error,
         )
+
+    def _index_candidate(
+        self,
+        path: Path,
+        root: Path,
+        counts: _CrawlCounts,
+    ) -> "_IndexCandidate | None":
+        classification = self._classify_for_root(path, root)
+        file_fingerprint = fingerprint_file(path)
+        stored = self.db.get_source_file(str(path))
+        if (
+            stored is not None
+            and stored["fingerprint"] == file_fingerprint.fingerprint
+            and stored["status"] == "indexed"
+            and self._has_index_artifacts(path)
+        ):
+            counts.skipped_count += 1
+            return None
+        return _IndexCandidate(path, root, classification, file_fingerprint)
+
+    def _prepare_candidate(self, candidate: "_IndexCandidate") -> "_PreparedCandidate":
+        preparer = getattr(self.indexer, "prepare_path")
+        return _PreparedCandidate(candidate, preparer(candidate.path))
+
+    def _drain_ready_prepared(
+        self,
+        pending: dict[Future, "_IndexCandidate"],
+        prepared_batch: list["_PreparedCandidate"],
+        counts: _CrawlCounts,
+        job_id: int,
+        *,
+        wait_for_one: bool,
+    ) -> str | None:
+        if not pending:
+            return None
+
+        if wait_for_one:
+            done, _not_done = wait(set(pending.keys()), return_when=FIRST_COMPLETED)
+        else:
+            done = {future for future in pending if future.done()}
+        if not done:
+            return None
+
+        for future in done:
+            candidate = pending.pop(future)
+            try:
+                prepared_batch.append(future.result())
+            except Exception as error:
+                self._record_source_file(
+                    path=candidate.path,
+                    classification=candidate.classification,
+                    fingerprint=candidate.fingerprint,
+                    status="error",
+                    error=str(error),
+                )
+                counts.error_count += 1
+                self._update_job(
+                    job_id,
+                    counts,
+                    status="running",
+                    message=str(candidate.path),
+                )
+                continue
+
+            if len(prepared_batch) >= self.index_batch_size:
+                flush_error = self._flush_prepared_batch(prepared_batch, counts, job_id)
+                if flush_error is not None:
+                    return flush_error
+        return None
+
+    def _flush_prepared_batch(
+        self,
+        prepared_batch: list["_PreparedCandidate"],
+        counts: _CrawlCounts,
+        job_id: int,
+    ) -> str | None:
+        if not prepared_batch:
+            return None
+
+        batch = list(prepared_batch)
+        prepared_batch.clear()
+        batch_indexer = getattr(self.indexer, "index_prepared_batch")
+        try:
+            results = batch_indexer([item.prepared for item in batch])
+        except VectorIndexingError as error:
+            for item in batch:
+                self._record_source_file(
+                    path=item.candidate.path,
+                    classification=item.candidate.classification,
+                    fingerprint=item.candidate.fingerprint,
+                    status="vector_pending",
+                    error=str(error),
+                )
+                counts.error_count += 1
+            return f"vector indexing failed: {error}"
+        except Exception as error:
+            for item in batch:
+                self._record_source_file(
+                    path=item.candidate.path,
+                    classification=item.candidate.classification,
+                    fingerprint=item.candidate.fingerprint,
+                    status="error",
+                    error=str(error),
+                )
+                counts.error_count += 1
+            return f"indexing failed: {error}"
+
+        for item in batch:
+            indexed_chunks = int(results.get(str(item.candidate.path), 0))
+            if indexed_chunks <= 0:
+                self._record_source_file(
+                    path=item.candidate.path,
+                    classification=item.candidate.classification,
+                    fingerprint=item.candidate.fingerprint,
+                    status="skipped",
+                    error=None,
+                )
+                counts.skipped_count += 1
+            else:
+                self._record_source_file(
+                    path=item.candidate.path,
+                    classification=item.candidate.classification,
+                    fingerprint=item.candidate.fingerprint,
+                    status="indexed",
+                    error=None,
+                )
+                counts.indexed_count += 1
+                self._pending_flush_sources.append(
+                    _IndexedSource(
+                        item.candidate.path,
+                        item.candidate.classification,
+                        item.candidate.fingerprint,
+                    )
+                )
+            self._update_job(
+                job_id,
+                counts,
+                status="running",
+                message=str(item.candidate.path),
+            )
+
+        return self._maybe_flush_indexer(counts)
+
+    def _can_use_pipeline(self) -> bool:
+        return (
+            self.extract_workers > 1
+            and callable(getattr(self.indexer, "prepare_path", None))
+            and callable(getattr(self.indexer, "index_prepared_batch", None))
+        )
+
+    def _maybe_flush_indexer(self, counts: _CrawlCounts) -> str | None:
+        if (
+            counts.indexed_count > 0
+            and self._pending_flush_sources
+            and counts.indexed_count % self.save_every == 0
+        ):
+            return self._flush_indexer(counts)
+        return None
+
+    def _flush_indexer(self, counts: _CrawlCounts) -> str | None:
+        flusher = getattr(self.indexer, "flush", None)
+        if not callable(flusher):
+            self._pending_flush_sources.clear()
+            return None
+        try:
+            flusher()
+        except Exception as error:
+            message = str(error)
+            pending = list(self._pending_flush_sources)
+            self._pending_flush_sources.clear()
+            for source in pending:
+                self.db.mark_chunks_vector_pending_for_source_prefix(str(source.path))
+                self._record_source_file(
+                    path=source.path,
+                    classification=source.classification,
+                    fingerprint=source.fingerprint,
+                    status="vector_pending",
+                    error=message,
+                )
+                counts.error_count += 1
+            return f"vector flush failed: {message}"
+        self._pending_flush_sources.clear()
+        return None
+
+    def _set_deferred_vector_save(self, enabled: bool) -> bool | None:
+        if not hasattr(self.indexer, "defer_vector_save"):
+            return None
+        previous = bool(getattr(self.indexer, "defer_vector_save"))
+        setattr(self.indexer, "defer_vector_save", enabled)
+        return previous
+
+    def _restore_deferred_vector_save(self, previous: bool | None) -> None:
+        if previous is None:
+            return
+        setattr(self.indexer, "defer_vector_save", previous)
 
     def _classify_for_root(self, path: Path, root: Path) -> Classification:
         classification = classify_path(path)
@@ -304,6 +632,27 @@ class _CrawlCounts:
     indexed_count: int = 0
     skipped_count: int = 0
     error_count: int = 0
+
+
+@dataclass(frozen=True)
+class _IndexedSource:
+    path: Path
+    classification: Classification
+    fingerprint: FileFingerprint
+
+
+@dataclass(frozen=True)
+class _IndexCandidate:
+    path: Path
+    root: Path
+    classification: Classification
+    fingerprint: FileFingerprint
+
+
+@dataclass(frozen=True)
+class _PreparedCandidate:
+    candidate: _IndexCandidate
+    prepared: object
 
 
 _GAME_DIR_NAMES = {

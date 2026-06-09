@@ -15,6 +15,8 @@ Launcher browser lama tetap tersedia lewat `scripts\Start-DocVec.cmd`; itu membu
 ## Index Refresh
 
 - Manual `Refresh Index` di GUI menjalankan incremental scan. File unchanged di-skip memakai fingerprint `path + size + mtime_ns`, file baru di-index, file berubah di-index ulang, dan file yang hilang ditandai deleted.
+- Scan besar memakai bounded extractor pipeline: beberapa file diekstrak paralel, chunk dikumpulkan, embedding dijalankan batch, lalu SQLite/turbovec ditulis oleh writer tunggal.
+- Vector index di-flush berkala, bukan setiap file, supaya disk write `vectors.tvim` tidak menjadi bottleneck. Jika flush gagal, source ditandai `vector_pending` untuk retry.
 - API production menjalankan auto refresh tiap 1 jam selama DocVec API/native app hidup.
 - Auto refresh hanya mulai saat Windows melaporkan laptop sedang charging/AC power dan idle minimal 10 menit.
 - Auto refresh memakai root `C:\`, `D:\`, `E:\`; policy C: tetap hanya memasukkan AI memory/session penting.

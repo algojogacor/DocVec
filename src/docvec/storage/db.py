@@ -181,6 +181,34 @@ class DocVecDB:
                 )
         return deactivated_ids
 
+    def mark_chunks_vector_pending_for_source_prefix(self, source_prefix: str) -> list[int]:
+        source_pattern = _escape_like(source_prefix) + "#%"
+        with closing(self.connect()) as connection:
+            with connection:
+                rows = connection.execute(
+                    """
+                    SELECT id
+                    FROM chunks
+                    WHERE (source_path = ? OR source_path LIKE ? ESCAPE '!')
+                      AND active = 1
+                    ORDER BY id
+                    """,
+                    (source_prefix, source_pattern),
+                ).fetchall()
+                pending_ids = [int(row["id"]) for row in rows]
+                connection.execute(
+                    """
+                    UPDATE chunks
+                    SET active = 0,
+                        vector_status = 'vector_pending',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE (source_path = ? OR source_path LIKE ? ESCAPE '!')
+                      AND active = 1
+                    """,
+                    (source_prefix, source_pattern),
+                )
+        return pending_ids
+
     def list_active_chunk_ids_for_source_prefix(self, source_prefix: str) -> list[int]:
         source_pattern = _escape_like(source_prefix) + "#%"
         with closing(self.connect()) as connection:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 from docvec.chunking import chunk_record
@@ -20,7 +21,7 @@ from docvec.extractors.documents import (
 )
 from docvec.extractors.hermes import extract_hermes_memory_store_db, extract_hermes_state_db
 from docvec.extractors.text import extract_text_file
-from docvec.models import ExtractedRecord
+from docvec.models import Chunk, ExtractedRecord
 from docvec.paths import classify_path
 from docvec.storage.db import DocVecDB
 from docvec.vectors import VectorBackend
@@ -28,6 +29,12 @@ from docvec.vectors import VectorBackend
 
 class VectorIndexingError(RuntimeError):
     """Raised when chunk text is stored but vector indexing could not complete."""
+
+
+@dataclass(frozen=True)
+class PreparedIndex:
+    path: Path
+    chunks: list[Chunk]
 
 
 class DocVecIndexer:
@@ -48,6 +55,8 @@ class DocVecIndexer:
         self.storage_hard_stop_bytes = storage_hard_stop_bytes
         self.ignore_skip_dirs = ignore_skip_dirs
         self.include_archives = include_archives
+        self.defer_vector_save = False
+        self._vectors_dirty = False
 
     def _extract(self, path: Path) -> list[ExtractedRecord]:
         classification = classify_path(path)
@@ -84,68 +93,82 @@ class DocVecIndexer:
             return [extract_transcript_file(path, classification.kind)]
         return [extract_text_file(path, classification.kind)]
 
-    def index_path(self, path: Path) -> int:
-        ensure_storage_budget(self.data_dir, self.storage_hard_stop_bytes)
+    def prepare_path(self, path: Path) -> PreparedIndex:
         classification = classify_path(path)
         if classification.should_skip and not (
             self.ignore_skip_dirs and classification.reason in _IGNORABLE_SKIP_REASONS
             or self._is_included_archive(classification, path)
         ):
-            return 0
+            return PreparedIndex(path=path, chunks=[])
 
         records = self._extract(path)
-
-        if not records:
-            deactivated_ids = self.db.deactivate_chunks_for_source_prefix(str(path))
-            if deactivated_ids:
-                self.vectors.remove(deactivated_ids)
-                self.vectors.save()
-                self.db.purge_inactive_chunks(deactivated_ids)
-            ensure_storage_budget(self.data_dir, self.storage_hard_stop_bytes)
-            return 0
-
         chunks = []
         for record in records:
             chunks.extend(chunk_record(record, max_words=900, overlap_words=120))
-        if not chunks:
-            deactivated_ids = self.db.deactivate_chunks_for_source_prefix(str(path))
-            if deactivated_ids:
-                self.vectors.remove(deactivated_ids)
-                self.vectors.save()
-                self.db.purge_inactive_chunks(deactivated_ids)
-            ensure_storage_budget(self.data_dir, self.storage_hard_stop_bytes)
-            return 0
+        return PreparedIndex(path=path, chunks=chunks)
 
-        chunk_ids = [self.db.stage_chunk(chunk) for chunk in chunks]
+    def index_path(self, path: Path) -> int:
+        return self.index_prepared(self.prepare_path(path))
 
-        new_items = [
-            (index, chunk_id)
-            for index, chunk_id in enumerate(chunk_ids)
-            if not self.vectors.contains(chunk_id)
-        ]
-        if new_items:
-            new_indexes = [index for index, _chunk_id in new_items]
-            new_ids = [chunk_id for _index, chunk_id in new_items]
-            new_texts = [chunks[index].text for index in new_indexes]
-            embeddings = self.embedder.embed(new_texts)
+    def index_prepared(self, prepared: PreparedIndex) -> int:
+        return self.index_prepared_batch([prepared]).get(str(prepared.path), 0)
+
+    def index_prepared_batch(
+        self,
+        prepared_items: list[PreparedIndex],
+    ) -> dict[str, int]:
+        ensure_storage_budget(self.data_dir, self.storage_hard_stop_bytes)
+        results: dict[str, int] = {}
+        activation_plan: list[tuple[PreparedIndex, list[int]]] = []
+        missing_ids: list[int] = []
+        missing_texts: list[str] = []
+
+        for prepared in prepared_items:
+            path_key = str(prepared.path)
+            chunks = prepared.chunks
+            if not chunks:
+                deactivated_ids = self.db.deactivate_chunks_for_source_prefix(path_key)
+                if deactivated_ids:
+                    self.vectors.remove(deactivated_ids)
+                    self._save_vectors_if_needed()
+                    self.db.purge_inactive_chunks(deactivated_ids)
+                results[path_key] = 0
+                continue
+
+            chunk_ids = [self.db.stage_chunk(chunk) for chunk in chunks]
+            activation_plan.append((prepared, chunk_ids))
+            results[path_key] = len(chunks)
+
+            for index, chunk_id in enumerate(chunk_ids):
+                if not self.vectors.contains(chunk_id):
+                    missing_ids.append(chunk_id)
+                    missing_texts.append(chunks[index].text)
+
+        if missing_ids:
             try:
-                self.vectors.add(new_ids, embeddings)
-                self.vectors.save()
+                embeddings = self.embedder.embed(missing_texts)
+                self.vectors.add(missing_ids, embeddings)
+                self._save_vectors_if_needed()
             except Exception as error:
                 try:
-                    self.vectors.remove(new_ids)
-                    self.vectors.save()
+                    self.vectors.remove(missing_ids)
+                    self._save_vectors_if_needed()
                 except Exception:
                     pass
                 raise VectorIndexingError(str(error)) from error
 
-        deactivated_ids = self.db.activate_chunks_for_source_prefix(str(path), chunk_ids)
-        if deactivated_ids:
-            self.vectors.remove(deactivated_ids)
-            self.vectors.save()
-            self.db.purge_inactive_chunks(deactivated_ids)
+        for prepared, chunk_ids in activation_plan:
+            deactivated_ids = self.db.activate_chunks_for_source_prefix(
+                str(prepared.path),
+                chunk_ids,
+            )
+            if deactivated_ids:
+                self.vectors.remove(deactivated_ids)
+                self._save_vectors_if_needed()
+                self.db.purge_inactive_chunks(deactivated_ids)
+
         ensure_storage_budget(self.data_dir, self.storage_hard_stop_bytes)
-        return len(chunks)
+        return results
 
     def has_vectors_for_source(self, path: Path) -> bool:
         chunk_ids = self.db.list_active_chunk_ids_for_source_prefix(str(path))
@@ -158,12 +181,23 @@ class DocVecIndexer:
             self.vectors.save()
         return len(deactivated_ids)
 
+    def flush(self) -> None:
+        if not self._vectors_dirty:
+            return
+        self.vectors.save()
+        self._vectors_dirty = False
+
     def _is_included_archive(self, classification, path: Path) -> bool:
         return (
             self.include_archives
             and classification.reason == "archive_extension"
             and path.suffix.lower() == ".zip"
         )
+
+    def _save_vectors_if_needed(self) -> None:
+        self._vectors_dirty = True
+        if not self.defer_vector_save:
+            self.flush()
 
 
 _IGNORABLE_SKIP_REASONS = {"skip_dir", "appdata", "game_folder"}
