@@ -46,10 +46,23 @@ class DocVecDB:
                 return self._upsert_chunk(connection, chunk, metadata_json, activate=True)
 
     def stage_chunk(self, chunk: Chunk) -> int:
-        metadata_json = json.dumps(chunk.metadata, ensure_ascii=False, sort_keys=True)
+        return self.stage_chunks([chunk])[0]
+
+    def stage_chunks(self, chunks: list[Chunk]) -> list[int]:
+        if not chunks:
+            return []
+
         with closing(self.connect()) as connection:
             with connection:
-                return self._upsert_chunk(connection, chunk, metadata_json, activate=False)
+                return [
+                    self._upsert_chunk(
+                        connection,
+                        chunk,
+                        json.dumps(chunk.metadata, ensure_ascii=False, sort_keys=True),
+                        activate=False,
+                    )
+                    for chunk in chunks
+                ]
 
     def _upsert_chunk(
         self,

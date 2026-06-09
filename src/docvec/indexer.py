@@ -135,7 +135,7 @@ class DocVecIndexer:
                 results[path_key] = 0
                 continue
 
-            chunk_ids = [self.db.stage_chunk(chunk) for chunk in chunks]
+            chunk_ids = self.db.stage_chunks(chunks)
             activation_plan.append((prepared, chunk_ids))
             results[path_key] = len(chunks)
 
