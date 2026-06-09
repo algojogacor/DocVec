@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Protocol
 
-from docvec.config import DEFAULT_MAX_FILE_BYTES, is_skip_dir_name
+from docvec.config import is_skip_dir_name, max_file_bytes_for_path
 from docvec.fingerprints import FileFingerprint, fingerprint_file
 from docvec.indexer import VectorIndexingError
 from docvec.models import Classification, SourceKind
@@ -551,7 +551,7 @@ class DocVecCrawler:
             return True
         if classification.kind == SourceKind.AI_SESSION:
             return False
-        return size_bytes > DEFAULT_MAX_FILE_BYTES
+        return size_bytes > max_file_bytes_for_path(path)
 
     def _is_included_archive(self, classification: Classification, path: Path) -> bool:
         return (

@@ -12,6 +12,9 @@ STORAGE_TARGET_BYTES = 10 * 1024**3
 STORAGE_HARD_STOP_BYTES = 12 * 1024**3
 
 DEFAULT_MAX_FILE_BYTES = 20 * 1024**2
+OFFICE_DOCUMENT_MAX_FILE_BYTES = 500 * 1024**2
+PDF_MAX_FILE_BYTES = 150 * 1024**2
+OFFICE_DOCUMENT_EXTENSIONS = {".docx", ".pptx", ".xlsx"}
 
 
 class StorageBudgetExceeded(RuntimeError):
@@ -37,6 +40,15 @@ def ensure_storage_budget(
         raise StorageBudgetExceeded(
             f"DocVec data usage is {usage} bytes, above hard stop {hard_stop_bytes} bytes"
         )
+
+
+def max_file_bytes_for_path(path: Path) -> int:
+    suffix = path.suffix.lower()
+    if suffix in OFFICE_DOCUMENT_EXTENSIONS:
+        return OFFICE_DOCUMENT_MAX_FILE_BYTES
+    if suffix == ".pdf":
+        return PDF_MAX_FILE_BYTES
+    return DEFAULT_MAX_FILE_BYTES
 
 
 SKIP_DIR_NAMES = {
