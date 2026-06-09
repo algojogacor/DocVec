@@ -1,0 +1,43 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+dist/
+build/
+node_modules/
+*.egg-info/
+
+# Private planning/tests are kept locally but not published.
+docs/
+tests/
+
+data/
+logs/
+*.log
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.tvim
+*.tv
+
+# Local secrets and provider key pools.
+.env
+.env.*
+!.env.example
+secrets/
+data/secrets/
+providers.json
+auth.json
+vault.json
+keys*.json
+
+src-ui/src-tauri/target/
+src-ui/src-tauri/gen/
+
+# Local reference clone and copied session logs are not part of the root repo.
+turbovec/
+rollout-*.jsonl
