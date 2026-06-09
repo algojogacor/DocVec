@@ -12,9 +12,10 @@
 
 body {
   margin: 0;
-  min-width: 960px;
+  min-width: 0;
   min-height: 100vh;
   background: #101010;
+  overflow: hidden;
 }
 
 button,
@@ -26,8 +27,10 @@ select {
 .app-shell {
   display: grid;
   grid-template-columns: 250px minmax(0, 1fr);
-  min-height: 100vh;
+  height: 100vh;
+  min-width: 0;
   background: #111311;
+  overflow: hidden;
 }
 
 .sidebar {
@@ -82,12 +85,15 @@ select {
 }
 
 .nav-item,
+.root-row,
 .result-row,
+.drive-tile,
 .toolbar button,
 .preview-actions button {
   border: 0;
   color: #ecefec;
   background: transparent;
+  cursor: pointer;
 }
 
 .nav-item {
@@ -128,10 +134,19 @@ select {
   display: flex;
   align-items: center;
   gap: 8px;
+  width: 100%;
   min-width: 0;
+  min-height: 28px;
   padding: 0 10px;
+  border-radius: 5px;
   color: #c7cec7;
+  background: transparent;
   font-size: 12px;
+  text-align: left;
+}
+
+.root-row:hover {
+  background: #282b28;
 }
 
 .root-row span,
@@ -146,7 +161,8 @@ select {
   display: grid;
   grid-template-rows: auto auto auto minmax(0, 1fr) auto;
   min-width: 0;
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
 }
 
 .titlebar,
@@ -217,6 +233,8 @@ select {
 
 .toolbar {
   padding: 8px 16px;
+  flex-wrap: wrap;
+  align-content: center;
 }
 
 .toolbar button,
@@ -229,6 +247,7 @@ select {
   padding: 0 10px;
   border-radius: 5px;
   color: #dce2dc;
+  white-space: nowrap;
 }
 
 .saved-search-select {
@@ -246,7 +265,8 @@ select {
 }
 
 .toolbar-spacer {
-  flex: 1;
+  flex: 1 1 20px;
+  min-width: 0;
 }
 
 .profile-toggle {
@@ -311,6 +331,7 @@ select {
   gap: 12px;
   padding: 8px 16px;
   background: #171a17;
+  overflow: hidden;
 }
 
 .filterbar label {
@@ -344,7 +365,7 @@ select {
 }
 
 .filterbar .path-filter {
-  flex: 1;
+  flex: 1 1 220px;
 }
 
 .filterbar .path-filter input {
@@ -353,8 +374,10 @@ select {
 
 .content-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 340px;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 340px);
   min-height: 0;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .content-list {
@@ -365,6 +388,7 @@ select {
 
 .drive-strip {
   display: flex;
+  flex-wrap: wrap;
   gap: 16px;
   margin-bottom: 22px;
 }
@@ -373,10 +397,18 @@ select {
   display: flex;
   align-items: center;
   gap: 12px;
-  min-width: 220px;
+  min-width: min(220px, 100%);
   padding: 10px;
+  border: 1px solid transparent;
   border-radius: 5px;
   background: #252925;
+  text-align: left;
+}
+
+.drive-tile:hover,
+.drive-tile.active {
+  border-color: #2bd486;
+  background: #29312d;
 }
 
 .drive-meta {
@@ -633,6 +665,16 @@ select {
   border-left: 1px solid #3b423b;
   background: #121512;
   box-shadow: -18px 0 34px rgba(0, 0, 0, 0.34);
+}
+
+@media (max-width: 1280px) {
+  .api-state {
+    display: none;
+  }
+
+  .saved-search-select {
+    min-width: 130px;
+  }
 }
 
 .logs-header {

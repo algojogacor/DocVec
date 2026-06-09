@@ -62,19 +62,21 @@ const scanProfiles = {
   },
 } as const;
 
-const sidebar = [
-  { label: "Quick Access", icon: Home, active: false },
-  { label: "This PC", icon: HardDrive, active: true },
-  { label: "Projects", icon: Folder, active: false },
-  { label: "AI Sessions", icon: Bot, active: false },
-  { label: "Hermes Brain", icon: Sparkles, active: false },
-  { label: "DocVec Index", icon: Database, active: false },
+type SidebarKey = "quick" | "this-pc" | "projects" | "sessions" | "brain" | "index";
+
+const sidebar: Array<{ key: SidebarKey; label: string; icon: typeof Home }> = [
+  { key: "quick", label: "Quick Access", icon: Home },
+  { key: "this-pc", label: "This PC", icon: HardDrive },
+  { key: "projects", label: "Projects", icon: Folder },
+  { key: "sessions", label: "AI Sessions", icon: Bot },
+  { key: "brain", label: "Hermes Brain", icon: Sparkles },
+  { key: "index", label: "DocVec Index", icon: Database },
 ];
 
 const drives = [
-  { name: "OS (C:)", free: "27.5 GB free", fill: 72 },
-  { name: "DATA (D:)", free: "26.9 GB free", fill: 68 },
-  { name: "Dokumen Penting (E:)", free: "14.2 GB free", fill: 58 },
+  { name: "OS (C:)", free: "27.5 GB free", fill: 72, drive: "C:" },
+  { name: "DATA (D:)", free: "26.9 GB free", fill: 68, drive: "D:" },
+  { name: "Dokumen Penting (E:)", free: "14.2 GB free", fill: 58, drive: "E:" },
 ];
 
 const sourceFilterOptions = [
@@ -242,6 +244,7 @@ export function App() {
   const [logsOpen, setLogsOpen] = useState(false);
   const [logLines, setLogLines] = useState<string[]>([]);
   const [logError, setLogError] = useState<string | null>(null);
+  const [activeSection, setActiveSection] = useState<SidebarKey>("this-pc");
 
   const sortedResults = useMemo(
     () => [...results].sort((left, right) => compareResults(left, right, sortKey, sortDirection)),
@@ -348,6 +351,58 @@ export function App() {
     setFileTypeFilter(filters.file_type ?? "");
     setDateFromFilter(filters.date_from ?? "");
     setDateToFilter(filters.date_to ?? "");
+  }
+
+  function clearFilters() {
+    applyFilters({});
+  }
+
+  function navigateSidebar(section: SidebarKey) {
+    setActiveSection(section);
+    if (section === "quick") {
+      setScanProfile("focused");
+      setSourceKindFilter("");
+      setPathFilter("hermes");
+      setProjectFilter("");
+      return;
+    }
+    if (section === "this-pc") {
+      setScanProfile("full");
+      clearFilters();
+      return;
+    }
+    if (section === "projects") {
+      setScanProfile("focused");
+      setSourceKindFilter("project_source");
+      setPathFilter("D:\\hermes\\projects");
+      return;
+    }
+    if (section === "sessions") {
+      setScanProfile("focused");
+      setSourceKindFilter("ai_session");
+      setPathFilter("");
+      return;
+    }
+    if (section === "brain") {
+      setScanProfile("focused");
+      setSourceKindFilter("ai_memory");
+      setPathFilter("D:\\hermes\\brain");
+      return;
+    }
+    clearFilters();
+  }
+
+  function selectRoot(root: string) {
+    setActiveSection("index");
+    setPathFilter(root);
+    setDriveFilter(root.match(/^[A-Z]:/i)?.[0].toUpperCase() ?? "");
+  }
+
+  function selectDrive(drive: string) {
+    setActiveSection("this-pc");
+    setScanProfile("full");
+    setDriveFilter(drive);
+    setPathFilter("");
   }
 
   function applySavedSearch(id: string) {
@@ -537,7 +592,12 @@ export function App() {
         </div>
         <nav className="nav-list">
           {sidebar.map((item) => (
-            <button className={item.active ? "nav-item active" : "nav-item"} key={item.label}>
+            <button
+              className={activeSection === item.key ? "nav-item active" : "nav-item"}
+              key={item.label}
+              onClick={() => navigateSidebar(item.key)}
+              type="button"
+            >
               <item.icon size={17} />
               <span>{item.label}</span>
             </button>
@@ -546,10 +606,10 @@ export function App() {
         <div className="sidebar-section">
           <span className="section-title">Pinned roots</span>
           {activeRoots.map((root) => (
-            <div className="root-row" key={root}>
+            <button className="root-row" key={root} onClick={() => selectRoot(root)} type="button">
               <Folder size={15} />
               <span>{root}</span>
-            </div>
+            </button>
           ))}
         </div>
       </aside>
@@ -748,7 +808,12 @@ export function App() {
           <section className="content-list">
             <div className="drive-strip">
               {drives.map((drive) => (
-                <div className="drive-tile" key={drive.name}>
+                <button
+                  className={driveFilter === drive.drive ? "drive-tile active" : "drive-tile"}
+                  key={drive.name}
+                  onClick={() => selectDrive(drive.drive)}
+                  type="button"
+                >
                   <HardDrive size={24} />
                   <div className="drive-meta">
                     <strong>{drive.name}</strong>
@@ -757,7 +822,7 @@ export function App() {
                     </div>
                     <small>{drive.free}</small>
                   </div>
-                </div>
+                </button>
               ))}
             </div>
 

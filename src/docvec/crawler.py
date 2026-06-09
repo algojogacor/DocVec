@@ -774,6 +774,7 @@ _NON_RELAXABLE_DIRECTORY_SKIP_REASONS = {
     "docvec_runtime_data",
     "gemini_extensions",
     "gemini_skills",
+    "skip_path_prefix",
 }
 
 

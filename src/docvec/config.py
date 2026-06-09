@@ -20,6 +20,38 @@ OFFICE_DOCUMENT_MAX_FILE_BYTES = 500 * 1024**2
 PDF_MAX_FILE_BYTES = 150 * 1024**2
 OFFICE_DOCUMENT_EXTENSIONS = {".docx", ".pptx", ".xlsx"}
 
+SKIP_PATH_PREFIXES = (
+    r"D:\.ollama",
+    r"D:\_cleanup_quarantine",
+    r"D:\_temp",
+    r"D:\Android",
+    r"D:\android-tools",
+    r"D:\BlueStacks X",
+    r"D:\BlueStacks_nxt",
+    r"D:\BuildTools",
+    r"D:\CapCut",
+    r"D:\Cursor AI",
+    r"D:\Docker",
+    r"D:\ffmpeg",
+    r"D:\flutter",
+    r"D:\Games",
+    r"D:\hf_cache",
+    r"D:\ollama",
+    r"D:\poppler",
+    r"D:\RIM WORLD",
+    r"D:\Spotify",
+    r"D:\SteamLibrary",
+    r"D:\Telegram Desktop",
+    r"D:\temp_skills_clone",
+    r"D:\VS Community",
+    r"D:\Windows Kits",
+    r"D:\Winrar",
+    r"D:\WizTree",
+    r"D:\WSL",
+    r"D:\d",
+    r"D:\hermes\migrated_from_wsl",
+)
+
 
 class StorageBudgetExceeded(RuntimeError):
     """Raised when DocVec local data crosses the configured hard stop."""
@@ -119,6 +151,8 @@ SKIP_DIR_NAMES = {
     ".nuxt",
     ".turbo",
     ".angular",
+    ".claw",
+    ".claude",
     ".nox",
     ".npm",
     ".parcel-cache",
@@ -126,6 +160,7 @@ SKIP_DIR_NAMES = {
     ".pnpm-store",
     ".svelte-kit",
     ".tox",
+    ".tmp-skill-research",
     ".uv-cache",
     ".vite",
     ".yarn",
@@ -135,7 +170,9 @@ SKIP_DIR_NAMES = {
     ".mypy_cache",
     ".ruff_cache",
     "bower_components",
+    "bugreports",
     "cache",
+    "game a plague tale",
     "pods",
     "pub-cache",
     "tmp",
@@ -143,6 +180,7 @@ SKIP_DIR_NAMES = {
     "ollama",
     "hf_cache",
     "image_cache",
+    "logs",
     "msdownld.tmp",
     "npm-cache",
     "onedrivetemp",
@@ -150,12 +188,15 @@ SKIP_DIR_NAMES = {
     "pip-cache",
     "pnpm-store",
     "site-packages",
+    "session_tiktok",
     "temp_pip",
     "uv-cache",
     "ubuntu",
     "windows kits",
     "vs community",
     "wsl",
+    "_commonredist",
+    "a plague tale - innocence",
 }
 
 SKIP_DIR_PREFIXES = ("ffmpeg-",)
@@ -165,6 +206,15 @@ def is_skip_dir_name(name: str) -> bool:
     normalized = name.lower()
     return normalized in SKIP_DIR_NAMES or any(
         normalized.startswith(prefix) for prefix in SKIP_DIR_PREFIXES
+    )
+
+
+def is_skip_path_prefix(path: Path) -> bool:
+    normalized = str(path).replace("/", "\\").lower().rstrip("\\")
+    return any(
+        normalized == prefix.lower().rstrip("\\")
+        or normalized.startswith(prefix.lower().rstrip("\\") + "\\")
+        for prefix in SKIP_PATH_PREFIXES
     )
 
 MEDIA_EXTENSIONS = {

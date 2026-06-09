@@ -17,6 +17,7 @@ docs/
 tests/
 
 data/
+backups/
 logs/
 *.log
 *.sqlite

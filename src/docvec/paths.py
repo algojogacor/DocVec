@@ -7,6 +7,7 @@ from docvec.config import (
     BINARY_EXTENSIONS,
     MEDIA_EXTENSIONS,
     is_skip_dir_name,
+    is_skip_path_prefix,
 )
 from docvec.models import Classification, SourceKind
 
@@ -142,6 +143,9 @@ def classify_path(path: Path) -> Classification:
 
     if _is_docvec_runtime_data(parts):
         return Classification(path, SourceKind.SYSTEM_CACHE, True, "docvec_runtime_data")
+
+    if is_skip_path_prefix(path):
+        return Classification(path, SourceKind.SYSTEM_CACHE, True, "skip_path_prefix")
 
     if _contains_sequence(parts, (".gemini", "antigravity-backup")):
         return Classification(path, SourceKind.SYSTEM_CACHE, True, "antigravity_backup")
