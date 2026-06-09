@@ -56,6 +56,17 @@ $env:DOCVEC_OLLAMA_BATCH_SIZE="64"
 
 Jika terjadi OOM atau Ollama melambat, turunkan ke `32` atau `16`. `DOCVEC_OLLAMA_BATCH_SIZE` mengatur ukuran batch teks yang DocVec kirim ke Ollama; `OLLAMA_NUM_PARALLEL` dan `OLLAMA_FLASH_ATTENTION` mengatur proses Ollama.
 
+Pipeline crawler juga bisa dioverride via env sebelum menjalankan DocVec:
+
+```powershell
+$env:DOCVEC_EXTRACT_WORKERS="4"
+$env:DOCVEC_INDEX_BATCH_SIZE="32"
+$env:DOCVEC_MAX_IN_FLIGHT="128"
+$env:DOCVEC_SAVE_EVERY="100"
+```
+
+`DOCVEC_EXTRACT_WORKERS` mengatur jumlah worker ekstraksi file, `DOCVEC_INDEX_BATCH_SIZE` mengatur jumlah prepared file yang dikirim ke writer per batch, `DOCVEC_MAX_IN_FLIGHT` membatasi antrean ekstraksi, dan `DOCVEC_SAVE_EVERY` mengatur seberapa sering vector index di-flush ke disk. Storage budget check saat crawl besar dilakukan pada batch pertama setelah flush dan saat flush periodik/final, bukan dua kali di setiap batch.
+
 Kalau ingin mencoba model lain, override via env:
 
 ```powershell

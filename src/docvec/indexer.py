@@ -57,6 +57,7 @@ class DocVecIndexer:
         self.include_archives = include_archives
         self.defer_vector_save = False
         self._vectors_dirty = False
+        self._storage_budget_checked_since_flush = False
 
     def _extract(self, path: Path) -> list[ExtractedRecord]:
         classification = classify_path(path)
@@ -117,7 +118,7 @@ class DocVecIndexer:
         self,
         prepared_items: list[PreparedIndex],
     ) -> dict[str, int]:
-        ensure_storage_budget(self.data_dir, self.storage_hard_stop_bytes)
+        self._ensure_storage_budget_before_batch()
         results: dict[str, int] = {}
         activation_plan: list[tuple[PreparedIndex, list[int]]] = []
         missing_ids: list[int] = []
@@ -167,7 +168,7 @@ class DocVecIndexer:
                 self._save_vectors_if_needed()
                 self.db.purge_inactive_chunks(deactivated_ids)
 
-        ensure_storage_budget(self.data_dir, self.storage_hard_stop_bytes)
+        self._ensure_storage_budget_after_batch()
         return results
 
     def has_vectors_for_source(self, path: Path) -> bool:
@@ -182,10 +183,12 @@ class DocVecIndexer:
         return len(deactivated_ids)
 
     def flush(self) -> None:
-        if not self._vectors_dirty:
-            return
-        self.vectors.save()
-        self._vectors_dirty = False
+        if self._vectors_dirty:
+            self.vectors.save()
+            self._vectors_dirty = False
+        if self.defer_vector_save and self._storage_budget_checked_since_flush:
+            self._check_storage_budget()
+            self._storage_budget_checked_since_flush = False
 
     def _is_included_archive(self, classification, path: Path) -> bool:
         return (
@@ -198,6 +201,19 @@ class DocVecIndexer:
         self._vectors_dirty = True
         if not self.defer_vector_save:
             self.flush()
+
+    def _ensure_storage_budget_before_batch(self) -> None:
+        if not self.defer_vector_save or not self._storage_budget_checked_since_flush:
+            self._check_storage_budget()
+            if self.defer_vector_save:
+                self._storage_budget_checked_since_flush = True
+
+    def _ensure_storage_budget_after_batch(self) -> None:
+        if not self.defer_vector_save:
+            self._check_storage_budget()
+
+    def _check_storage_budget(self) -> None:
+        ensure_storage_budget(self.data_dir, self.storage_hard_stop_bytes)
 
 
 _IGNORABLE_SKIP_REASONS = {"skip_dir", "appdata", "game_folder"}
